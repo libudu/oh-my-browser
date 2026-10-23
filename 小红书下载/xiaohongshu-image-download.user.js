@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         小红书列表 · 详情图片下载（实况仅图片）
+// @name         小红书列表 · 图片与视频下载（实况仅图片）
 // @namespace    oh-my-browser/xiaohongshu-images
-// @version      1.0.1
-// @description  悬停笔记卡片显示下载按钮，按顺序保存整篇笔记的详情图片；忽略实况视频，不使用列表缩略图。
+// @version      1.1.0
+// @description  悬停笔记卡片下载详情图片或纯视频笔记；实况仅保存静态图，不使用列表缩略图。
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
 // @grant        GM_addStyle
@@ -19,7 +19,7 @@
 
   const CARD = 'section.note-item';
   const BUTTON = 'xhs-image-download-button';
-  const savedImages = new Map();
+  const savedMedia = new Map();
   let downloading = false;
 
   function unwrap(value) {
@@ -161,6 +161,35 @@
     });
   }
 
+  function videoUrl(raw) {
+    if (typeof raw !== 'string' || !raw) return null;
+    let url;
+    try { url = new URL(raw); }
+    catch { return null; }
+    if (!['http:', 'https:'].includes(url.protocol) ||
+      !/(^|\.)xhscdn\.com$/i.test(url.hostname) || !/\.mp4$/i.test(url.pathname)) return null;
+    url.protocol = 'https:';
+    return url.href;
+  }
+
+  function selectVideo(note) {
+    // 必须先确认是视频笔记；图文中的 imageList[].stream 永远不参与选择。
+    if (note?.type !== 'video') throw new Error('不是纯视频笔记');
+    const stream = note.video?.media?.stream;
+    const candidates = Object.values(stream || {}).filter(Array.isArray).flat().map(item => {
+      const urls = [item.masterUrl || item.master_url,
+        ...(item.backupUrls || item.backup_urls || [])].map(videoUrl).filter(Boolean);
+      return { item, urls: [...new Set(urls)] };
+    }).filter(candidate => candidate.urls.length);
+    candidates.sort((a, b) =>
+      (Number(b.item.width) * Number(b.item.height) || 0) -
+        (Number(a.item.width) * Number(a.item.height) || 0) ||
+      (Number(b.item.avgBitrate || b.item.avg_bitrate) || 0) -
+        (Number(a.item.avgBitrate || a.item.avg_bitrate) || 0));
+    if (!candidates.length) throw new Error('详情中没有可下载的 MP4 视频地址，请打开笔记后重试');
+    return { index: 0, urls: candidates[0].urls };
+  }
+
   function cardLink(card) {
     const links = Array.from(card.querySelectorAll('a[href]'));
     const candidates = links.map(link => {
@@ -227,10 +256,14 @@
     let note;
     try { note = noteFromState(unsafeWindow.__INITIAL_STATE__, id); }
     catch { /* 部分脚本管理器限制页面对象访问，继续读取 HTML。 */ }
-    if (!note?.imageList?.length && !note?.image_list?.length) note = noteFromDocument(document, id);
-    if (!note?.imageList?.length && !note?.image_list?.length) note = await fetchNote(url, id);
+    const hasMedia = value => value?.type === 'video'
+      ? Object.values(value.video?.media?.stream || {}).some(list => Array.isArray(list) && list.length)
+      : value?.imageList?.length || value?.image_list?.length;
+    if (!hasMedia(note)) note = noteFromDocument(document, id);
+    if (!hasMedia(note)) note = await fetchNote(url, id);
+    if (note?.type === 'video') return { note, kind: 'video', media: [selectVideo(note)] };
     const images = selectImages(note);
-    return { note, images: openDetailImages(id, images.length) || images };
+    return { note, kind: 'image', media: openDetailImages(id, images.length) || images };
   }
 
   function detectImage(bytes) {
@@ -275,6 +308,49 @@
     });
   }
 
+  function detectVideo(bytes) {
+    if (bytes.length < 16 || detectImage(bytes)) return null;
+    const ascii = (start, length) => String.fromCharCode(...bytes.subarray(start, start + length));
+    if (ascii(4, 4) !== 'ftyp') return null;
+    const size = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+    if (size < 16 || size > bytes.length) return null;
+    const brands = [ascii(8, 4)];
+    for (let i = 16; i + 4 <= size; i += 4) brands.push(ascii(i, 4));
+    return brands.some(brand => /^(?:isom|iso[2-9]|mp4[12]|avc1|dash|M4V )$/.test(brand))
+      ? { ext: 'mp4', mime: 'video/mp4' } : null;
+  }
+
+  function requestVideo(url) {
+    if (!videoUrl(url)) return Promise.reject(new Error('已拦截非 MP4 视频地址'));
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'arraybuffer', timeout: 180000,
+        headers: { Referer: 'https://www.xiaohongshu.com/', Accept: 'video/mp4,application/octet-stream;q=0.9,*/*;q=0.8' },
+        onload(response) {
+          try {
+            if (response.status < 200 || response.status >= 300) throw new Error(`视频请求失败（HTTP ${response.status}）`);
+            if (response.finalUrl && !videoUrl(response.finalUrl)) throw new Error('视频被重定向到非 MP4 地址');
+            const bytes = new Uint8Array(response.response);
+            const format = detectVideo(bytes);
+            if (!format) throw new Error('响应不是支持的 MP4 视频，已拒绝保存（可能是图片或验证页面）');
+            resolve({ blob: new Blob([bytes], { type: format.mime }), ext: format.ext });
+          } catch (error) { reject(error); }
+        },
+        onerror: () => reject(new Error('视频网络请求失败')),
+        ontimeout: () => reject(new Error('视频下载超时')),
+      });
+    });
+  }
+
+  async function requestVideoWithFallback(urls) {
+    let lastError;
+    for (const url of urls) {
+      try { return await requestVideo(url); }
+      catch (error) { lastError = error; }
+    }
+    throw lastError || new Error('没有可下载的视频地址');
+  }
+
   function safeName(value) {
     return String(value || '').normalize('NFC').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
       .replace(/[.\s]+$/g, '').trim().slice(0, 70) || '小红书笔记';
@@ -301,7 +377,7 @@
             const messages = {
               not_enabled: '请在油猴设置中启用下载功能（下载模式选择“浏览器 API”）',
               not_permitted: '请授予油猴下载文件的权限',
-              not_whitelisted: '请在油猴下载扩展名白名单中允许 jpg/png/webp/gif/avif/heic',
+              not_whitelisted: '请在油猴下载扩展名白名单中允许 jpg/png/webp/gif/avif/heic/mp4',
               not_supported: '当前浏览器不支持油猴下载功能',
             };
             finish(new Error(messages[result?.error] || '文件保存失败或已取消'));
@@ -334,39 +410,44 @@
     let successes = 0;
     let total = 0;
     let done;
+    let kind;
     try {
       const { id, url } = cardLink(card);
-      const { note, images } = await loadNote(id, url);
-      total = images.length;
-      done = savedImages.get(id) || new Set();
+      const result = await loadNote(id, url);
+      const { note, media } = result;
+      kind = result.kind;
+      const isVideo = kind === 'video';
+      total = media.length;
+      const key = `${id}:${kind}`;
+      done = savedMedia.get(key) || new Set();
       if (done.size === total) done = new Set(); // 完整下载后，下一次点击允许重新下载。
-      savedImages.set(id, done);
+      savedMedia.set(key, done);
       successes = done.size;
       const author = note.user?.nickname || note.user?.nickName || '';
       const title = note.title || card.querySelector('.title')?.textContent || '小红书笔记';
       const prefix = `${safeName(author)}_${safeName(title)}_${id}`;
       const failures = [];
-      for (const image of images) {
-        if (done.has(image.index)) continue;
-        button.textContent = `下载 ${image.index + 1}/${total}`;
+      for (const item of media) {
+        if (done.has(item.index)) continue;
+        button.textContent = isVideo ? '下载视频…' : `下载 ${item.index + 1}/${total}`;
         try {
-          const { blob, ext } = await requestImage(image.url);
-          await saveBlob(blob, `${prefix}_${String(image.index + 1).padStart(2, '0')}.${ext}`);
-          done.add(image.index);
+          const { blob, ext } = await (isVideo ? requestVideoWithFallback(item.urls) : requestImage(item.url));
+          await saveBlob(blob, `${prefix}_${String(item.index + 1).padStart(2, '0')}.${ext}`);
+          done.add(item.index);
           successes++;
         } catch (error) {
-          failures.push(`第 ${image.index + 1} 张：${error.message}`);
+          failures.push(`${isVideo ? '视频' : `第 ${item.index + 1} 张`}：${error.message}`);
           // 权限配置错误时无需继续请求剩余图片。
           if (/油猴|权限|白名单|不支持油猴/.test(error.message)) break;
         }
       }
       if (failures.length) throw new Error(failures.join('；'));
-      button.textContent = `已下载 ${successes} 张`;
-      notify(`已保存 ${successes} 张详情图片（不包含实况视频）`);
+      button.textContent = isVideo ? '视频已下载' : `已下载 ${successes} 张`;
+      notify(isVideo ? '已保存视频' : `已保存 ${successes} 张详情图片（不包含实况视频）`);
     } catch (error) {
       button.textContent = total ? `重试 ${successes}/${total}` : '重试下载';
-      notify(`${total ? `已保存 ${successes}/${total} 张。` : ''}${error.message}`, true);
-      console.warn('[小红书图片下载]', error.message);
+      notify(`${total ? `已保存 ${successes}/${total} ${kind === 'video' ? '个视频' : '张图片'}。` : ''}${error.message}`, true);
+      console.warn('[小红书下载]', error.message);
     } finally {
       downloading = false;
       button.disabled = false;
@@ -381,8 +462,8 @@
       const button = document.createElement('button');
       button.className = BUTTON;
       button.type = 'button';
-      button.textContent = '↓ 下载图片';
-      button.title = '下载这篇笔记的全部详情图片（实况只保存静态图）';
+      button.textContent = '↓ 下载';
+      button.title = '下载这篇笔记的详情图片或视频（实况只保存静态图）';
       button.setAttribute('aria-label', button.title);
       for (const event of ['pointerdown', 'mousedown', 'dblclick']) {
         button.addEventListener(event, e => e.stopPropagation());
@@ -434,6 +515,7 @@
   // Node 的离线验证入口；网页环境不会导出或暴露下载 API。
   if (typeof module !== 'undefined' && module.exports && typeof document === 'undefined') {
     module.exports = { noteFromState, readObjectLiteral, noteFromDocument, imageUrl,
-      selectImages, cardLink, openDetailImages, detectImage, safeName, requestImage, saveBlob, loadNote, start };
+      selectImages, selectVideo, videoUrl, cardLink, openDetailImages, detectImage, detectVideo,
+      safeName, requestImage, requestVideo, requestVideoWithFallback, saveBlob, loadNote, downloadCard, start };
   } else { start(); }
 })();
