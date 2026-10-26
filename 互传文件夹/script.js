@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         互传网页版：视频文件夹
+// @name         互传网页版：文件夹
 // @namespace    linpicio.easyshare
-// @version      1.1.0
-// @description  多选实际文件夹筛选视频，沿用互传原有的选择、下载、删除和排序操作
+// @version      1.2.0
+// @description  多选实际文件夹筛选图片和视频，沿用互传原有的选择、下载、删除和排序操作
 // @match        http://192.168.1.91/*
 // @run-at       document-start
 // @grant        none
@@ -14,24 +14,50 @@
   "use strict";
 
   // 针对当前手机提供的 Web EasyShare web2.1.0.9；端口变化无需改脚本。
-  if (window.__easyshareVideoFolders) return;
+  if (window.__easyshareFolders || window.__easyshareVideoFolders) return;
+  window.__easyshareFolders = true;
+  // 占用旧标记，避免旧版脚本随后加载时重复包装 Redux。
   window.__easyshareVideoFolders = true;
 
-  const FILTER = "LINPICIO_EASYSHARE_VIDEO_FOLDER";
-  const RECEIVE = "RECEIVE_POSTS_VIDEOLIST";
-  const CLEAR_SELECTION = "PAGE_VIDEO_NORMAL_SHOW_OPERATION_BUTTON";
+  const FILTER = "LINPICIO_EASYSHARE_FOLDER";
+  const IMAGE_GROUP = "互传文件夹";
+  const media = {
+    video: {
+      label: "视频",
+      receive: "RECEIVE_POSTS_VIDEOLIST",
+      clearSelection: "PAGE_VIDEO_NORMAL_SHOW_OPERATION_BUTTON",
+      clearPage: "CLEAR_VIDEO_PAGE_DATA",
+      info: "videoInfo",
+      loading: "videoNormalListLoading",
+      container: "videoList_con",
+    },
+    image: {
+      label: "图片",
+      receive: "RECEIVE_POSTS_CALLERY",
+      clearSelection: "PAGE_IMAGE_CALLERY_SHOW_OPERATION_BUTTON",
+      clearPage: "CLEAR_IMAGECALLERY_PAGE_DATA",
+      info: "imageCalleryInfo",
+      loading: "imageGalleryLoading",
+      container: "imageContainer",
+    },
+  };
+  for (const channel of Object.values(media)) {
+    channel.fullPayload = null;
+    // null 表示全部；空 Set 表示不显示文件。图片和视频各自保留筛选条件。
+    channel.selectedFolders = null;
+    channel.folders = [];
+    channel.search = "";
+  }
   const UNKNOWN = "(无法识别文件夹)";
   const wrappedFactories = new WeakSet();
-  let fullPayload = null;
-  // null 表示全部视频；Set 表示多选的文件夹，空 Set 表示不显示视频。
-  let selectedFolders = null;
-  let folders = [];
   let store = null;
   let webpackRequire = null;
   let panel = null;
   let folderList = null;
   let caption = null;
-  let search = "";
+  let searchInput = null;
+  let title = null;
+  let activeChannel = null;
   let scheduled = false;
   let listDirty = true;
   let hooked = false;
@@ -45,113 +71,179 @@
     return separator > 0 ? normalized.slice(0, separator) : UNKNOWN;
   }
 
-  function rebuildFolders() {
+  function itemsOf(channel, payload) {
+    if (!payload) return [];
+    if (channel === media.video) return payload.videoList || [];
+    return (payload.foldersNameArray || []).flatMap(
+      (group) => payload.detailMap[group]?.photoInfo?.photoList || [],
+    );
+  }
+
+  function rebuildFolders(channel) {
     const counts = new Map();
-    for (const video of fullPayload?.videoList || []) {
-      const path = folderOf(video);
+    for (const item of itemsOf(channel, channel.fullPayload)) {
+      const path = folderOf(item);
       counts.set(path, (counts.get(path) || 0) + 1);
     }
-    folders = Array.from(counts, ([path, count]) => ({ path, count }));
-    folders.sort((a, b) =>
+    channel.folders = Array.from(counts, ([path, count]) => ({ path, count }));
+    channel.folders.sort((a, b) =>
       a.path.localeCompare(b.path, "zh-CN", { numeric: true }),
     );
-    if (selectedFolders !== null) {
+    if (channel.selectedFolders !== null) {
       const available = new Set(
-        [...selectedFolders].filter((path) => counts.has(path)),
+        [...channel.selectedFolders].filter((path) => counts.has(path)),
       );
-      if (available.size !== selectedFolders.size) selectedFolders = available;
+      if (available.size !== channel.selectedFolders.size)
+        channel.selectedFolders = available;
     }
     listDirty = true;
   }
 
-  function visiblePayload() {
-    const videoList =
-      selectedFolders === null
-        ? fullPayload.videoList
-        : fullPayload.videoList.filter((item) =>
-            selectedFolders.has(folderOf(item)),
-          );
+  function retainItems(channel, payload, predicate) {
+    if (channel === media.video) {
+      const videoList = payload.videoList.filter(predicate);
+      return { ...payload, videoList, count: videoList.length, isSelected: false };
+    }
+    const detailMap = {};
+    const foldersNameArray = [];
+    let count = 0;
+    for (const group of payload.foldersNameArray) {
+      const detail = payload.detailMap[group];
+      const photoList = detail.photoInfo.photoList.filter(predicate);
+      if (!photoList.length) continue;
+      foldersNameArray.push(group);
+      detailMap[group] = {
+        ...detail,
+        iconPath: photoList[0].savePath,
+        folderCnt: photoList.length,
+        photoInfo: {
+          ...detail.photoInfo,
+          photoList,
+          count: photoList.length,
+          isSelected: false,
+        },
+      };
+      count += photoList.length;
+    }
+    return { ...payload, detailMap, foldersNameArray, count, isSelected: false };
+  }
+
+  function visiblePayload(channel) {
+    const { fullPayload, selectedFolders } = channel;
+    const json = retainItems(
+      channel, fullPayload,
+      (item) => selectedFolders === null || selectedFolders.has(folderOf(item)),
+    );
+    if (channel === media.video || selectedFolders === null) return json;
+    // 用一个原生相册合并多个实际目录，原生预览、拖选和批量操作仍使用真实路径。
+    const photoList = itemsOf(channel, json);
     return {
-      ...fullPayload,
-      videoList,
-      count: videoList.length,
-      isSelected: false,
+      ...json,
+      foldersNameArray: photoList.length ? [IMAGE_GROUP] : [],
+      detailMap: photoList.length
+        ? {
+            [IMAGE_GROUP]: {
+              iconPath: photoList[0].savePath,
+              folderCnt: photoList.length,
+              photoInfo: { photoList, count: photoList.length, isSelected: false },
+            },
+          }
+        : {},
     };
   }
 
-  function clearNativeSelection(videoList) {
+  function clearNativeSelection(channel, json) {
     // 原网页依赖共享选择表和索引锚点；只隐藏 DOM 会导致批量操作选错文件。
     const shared = webpackRequire(2).a;
-    shared.videoSelected.clear();
-    shared.videoIsRecordSelect = true;
-    shared.videoList = videoList;
+    if (channel === media.video) {
+      shared.videoSelected.clear();
+      shared.videoIsRecordSelect = true;
+      shared.videoList = json.videoList;
+    } else {
+      shared.imageGallery.clear();
+      shared.imageGalleryInfo = json;
+      const Selection = webpackRequire(59).a;
+      for (const group of json.foldersNameArray) {
+        const selection = new Selection();
+        selection.list = json.detailMap[group].photoInfo.photoList;
+        selection.count = selection.list.length;
+        shared.imageGallery.put(group, selection);
+      }
+    }
     webpackRequire(20).a.setAnchor(0);
+  }
+
+  function applyFilter(originalReducer, previous, channel, action = {}, keepGroup = false) {
+    const json = visiblePayload(channel);
+    clearNativeSelection(channel, json);
+    let next = originalReducer(previous, {
+      ...action, type: channel.receive, json,
+    });
+    const currentGroup = previous?.getIn(["CommonData", "imageCalleryCurrentGroup"]);
+    if (keepGroup && channel === media.image &&
+        json.foldersNameArray.includes(currentGroup)) {
+      next = originalReducer(next, {
+        type: "HANDLE_IMAGE_CALLERY_CURRENT_GROUP_CHANGE", currentGroup,
+      });
+    }
+    return originalReducer(next, { type: channel.clearSelection, show: false });
   }
 
   function enhanceReducer(originalReducer) {
     return (previous, action) => {
       if (action.type === "Initialize") {
-        fullPayload = null;
-        selectedFolders = null;
-        rebuildFolders();
+        for (const channel of Object.values(media)) {
+          channel.fullPayload = null;
+          channel.selectedFolders = null;
+          rebuildFolders(channel);
+        }
       }
 
-      if (action.type === RECEIVE && Array.isArray(action.json?.videoList)) {
-        // 缓存完整列表，后续排序和原网页刷新会替换这份缓存。
-        fullPayload = {
-          ...action.json,
-          videoList: action.json.videoList.slice(),
-        };
-        rebuildFolders();
-        const json = visiblePayload();
-        clearNativeSelection(json.videoList);
-        const next = originalReducer(previous, { ...action, json });
-        return originalReducer(next, { type: CLEAR_SELECTION, show: false });
+      const receiving = Object.values(media).find(
+        (channel) => action.type === channel.receive,
+      );
+      const validPayload = receiving === media.video
+        ? Array.isArray(action.json?.videoList)
+        : Array.isArray(action.json?.foldersNameArray) && action.json?.detailMap;
+      if (receiving && validPayload) {
+        // 复制完整列表；刷新、排序响应替换缓存，筛选和删除不会改写响应对象。
+        receiving.fullPayload = retainItems(receiving, action.json, () => true);
+        rebuildFolders(receiving);
+        return applyFilter(originalReducer, previous, receiving, action);
       }
 
-      if (action.type === FILTER && fullPayload) {
-        selectedFolders =
+      const filtering = media[action.media];
+      if (action.type === FILTER && filtering?.fullPayload) {
+        if (interactionBlocked(previous, filtering)) return previous;
+        filtering.selectedFolders =
           action.folders === null ? null : new Set(action.folders);
         listDirty = true;
-        const json = visiblePayload();
-        clearNativeSelection(json.videoList);
-        const next = originalReducer(previous, { type: RECEIVE, json });
-        return originalReducer(next, { type: CLEAR_SELECTION, show: false });
+        return applyFilter(originalReducer, previous, filtering);
       }
 
       let next = originalReducer(previous, action);
-      if (fullPayload && previous && action.type !== "CLEAR_VIDEO_PAGE_DATA") {
-        const before = previous.getIn(["CommonData", "videoInfo", "videoList"]);
-        const after = next.getIn(["CommonData", "videoInfo", "videoList"]);
+      for (const channel of Object.values(media)) {
+        if (!channel.fullPayload || !previous || action.type === channel.clearPage)
+          continue;
+        const before = previous.getIn(["CommonData", channel.info]);
+        const after = next.getIn(["CommonData", channel.info]);
         if (before && after && before !== after) {
           // 单个/批量删除及手机推送更新仍由原 reducer 执行，然后同步缓存。
-          const remaining = new Set(after.toJS().map((item) => item.savePath));
+          const remaining = new Set(
+            itemsOf(channel, after.toJS()).map((item) => item.savePath),
+          );
           const removed = new Set(
-            before
-              .toJS()
+            itemsOf(channel, before.toJS())
               .filter((item) => !remaining.has(item.savePath))
               .map((item) => item.savePath),
           );
           if (removed.size) {
-            const videoList = fullPayload.videoList.filter(
+            channel.fullPayload = retainItems(
+              channel, channel.fullPayload,
               (item) => !removed.has(item.savePath),
             );
-            fullPayload = {
-              ...fullPayload,
-              videoList,
-              count: videoList.length,
-            };
-            const oldFolders = selectedFolders;
-            rebuildFolders();
-            if (oldFolders !== selectedFolders) {
-              const json = visiblePayload();
-              clearNativeSelection(json.videoList);
-              next = originalReducer(next, { type: RECEIVE, json });
-              next = originalReducer(next, {
-                type: CLEAR_SELECTION,
-                show: false,
-              });
-            }
+            rebuildFolders(channel);
+            next = applyFilter(originalReducer, next, channel, {}, true);
           }
         }
       }
@@ -231,6 +323,17 @@
         box-sizing:border-box; padding:12px; background:#fff; color:#333; border:1px solid #ddd;
         border-radius:8px; box-shadow:0 3px 16px #0002; font:13px/1.5 "Microsoft YaHei",sans-serif; }
       #esvf-panel * { box-sizing:border-box; }
+      #esvf-panel[hidden] { display:none; }
+      #videoList_con.esvf-layout > .videoList,
+      #imageContainer.esvf-layout > .imageList {
+        width:calc(100% - var(--esvf-offset)) !important;
+        margin-left:var(--esvf-offset) !important;
+      }
+      #imageContainer.esvf-layout > .imgGroupList {
+        margin-left:296px;
+      }
+      #imageContainer.esvf-merged > .imgGroupList,
+      #imageContainer.esvf-layout > .imgGroupListNoData { display:none; }
       .esvf-title { font-size:15px; font-weight:bold; margin-bottom:5px; }
       .esvf-caption { margin-bottom:9px; color:#666; overflow-wrap:anywhere; }
       .esvf-search { display:block; width:100%; height:32px; padding:5px 8px; margin-bottom:8px;
@@ -260,18 +363,20 @@
     addStyles();
     panel = element("aside");
     panel.id = "esvf-panel";
-    panel.setAttribute("aria-label", "视频文件夹筛选");
+    panel.setAttribute("aria-label", "互传文件夹筛选");
     panel.hidden = true;
-    panel.append(element("div", "esvf-title", "视频文件夹 · 多选"));
+    title = element("div", "esvf-title");
+    panel.append(title);
     caption = element("div", "esvf-caption");
     panel.append(caption);
     const input = element("input", "esvf-search");
     input.type = "search";
     input.placeholder = "搜索文件夹名称或路径";
     input.setAttribute("aria-label", input.placeholder);
-    input.value = search;
+    searchInput = input;
     input.addEventListener("input", () => {
-      search = input.value.toLocaleLowerCase().trim();
+      if (!activeChannel) return;
+      activeChannel.search = input.value.toLocaleLowerCase().trim();
       listDirty = true;
       scheduleUi();
     });
@@ -282,7 +387,7 @@
       element(
         "div",
         "esvf-note",
-        "勾选多个文件夹可合并显示；更改文件夹筛选会清空视频选择。",
+        "勾选多个文件夹可合并显示；更改文件夹筛选会清空当前文件选择。",
       ),
     );
     // 面板挂到 body，避免 React 重绘或拖选接管它。
@@ -294,8 +399,10 @@
   }
 
   function chooseFolder(path) {
-    if (!store || !fullPayload) return;
-    if (interactionBlocked(store.getState())) return;
+    const channel = activeChannel;
+    if (!store || !channel?.fullPayload) return;
+    const { selectedFolders } = channel;
+    if (interactionBlocked(store.getState(), channel)) return;
     if (path === null && selectedFolders === null) return;
     let selection = null;
     if (path !== null) {
@@ -305,9 +412,10 @@
     }
     store.dispatch({
       type: FILTER,
+      media: channel === media.image ? "image" : "video",
       folders: selection === null ? null : [...selection],
     });
-    const container = document.getElementById("videoList_con");
+    const container = document.getElementById(channel.container);
     if (container) {
       container.scrollTop = 0;
       for (const child of container.querySelectorAll("*")) {
@@ -316,10 +424,11 @@
     }
   }
 
-  function interactionBlocked(state) {
+  function interactionBlocked(state, channel) {
     // 删除确认和执行期间保持索引稳定，等待原网页完成操作后再允许切换。
     return Boolean(
-      state.getIn(["CommonData", "videoNormalListLoading"]) ||
+      state.getIn(["CommonData", channel.loading]) ||
+      state.getIn(["ImageFullScreen", "ImageFullScreenShow"]) ||
       state.getIn(["Dialog", "show"]) ||
       state.getIn(["Dialog", "isDeleteing"]) ||
       state.getIn(["DialogWithFunc", "show"]) ||
@@ -327,13 +436,14 @@
     );
   }
 
-  function folderButton(path, count, loading) {
+  function folderButton(channel, path, count, loading) {
+    const { selectedFolders } = channel;
     const button = element("button", "esvf-folder");
     button.type = "button";
     button.disabled = loading;
     if (path === null) {
       button.setAttribute("aria-pressed", String(selectedFolders === null));
-      button.append(element("span", "esvf-name", `全部视频 (${count})`));
+      button.append(element("span", "esvf-name", `全部${channel.label} (${count})`));
     } else {
       const checked = selectedFolders?.has(path) || false;
       button.setAttribute("role", "checkbox");
@@ -368,7 +478,7 @@
         const warning = element(
           "div",
           "",
-          "视频文件夹脚本未接入：请刷新页面，并确认 Tampermonkey 允许用户脚本。若仍无效，互传网页版本可能已变化。",
+          "互传文件夹脚本未接入：请刷新页面，并确认 Tampermonkey 允许用户脚本。若仍无效，互传网页版本可能已变化。",
         );
         warning.id = "esvf-error";
         document.body.append(warning);
@@ -377,46 +487,58 @@
     }
     mountPanel();
     const state = store.getState();
-    const active =
-      state.getIn(["PageSwitch", "VideoListShow"]) &&
-      state.getIn(["PageSwitch", "VideoNormalPageShow"]) &&
+    let channel = null;
+    if (state.getIn(["PageSwitch", "ImageListShow"]) &&
+        state.getIn(["PageSwitch", "ImageGalleryPageShow"])) channel = media.image;
+    else if (state.getIn(["PageSwitch", "VideoListShow"]) &&
+        state.getIn(["PageSwitch", "VideoNormalPageShow"])) channel = media.video;
+    const active = channel &&
       !state.getIn(["CommonData", "isSearching"]) &&
       state.getIn(["PageSwitch", "showMainPage"]);
+    if (channel !== activeChannel) {
+      activeChannel = channel;
+      listDirty = true;
+      lastBlocked = null;
+      searchInput.value = channel?.search || "";
+    }
     const modalOpen =
       state.getIn(["Dialog", "show"]) ||
       state.getIn(["DialogWithFunc", "show"]) ||
-      state.getIn(["Loading", "show"]);
+      state.getIn(["Loading", "show"]) ||
+      state.getIn(["ImageFullScreen", "ImageFullScreenShow"]);
     panel.hidden = !active || Boolean(modalOpen);
     if (!active || modalOpen) return;
-    const container = document.getElementById("videoList_con");
+    const container = document.getElementById(channel.container);
     if (!container) {
       panel.hidden = true;
       return;
     }
     const bounds = container.getBoundingClientRect();
-    // 留出原视频列表的空间，面板不参与 React 的 DOM 管理。
+    // 留出原列表的空间，面板不参与 React 的 DOM 管理。
     panel.style.left = `${Math.max(12, bounds.left + 12)}px`;
     panel.style.top = `${Math.max(12, bounds.top + 12)}px`;
-    const list = container.querySelector(".videoList");
-    if (list) {
-      const availableWidth = Math.max(180, container.clientWidth - 308);
-      list.style.width = `${availableWidth}px`;
-      list.style.marginLeft = "296px";
-    }
-    const loading = Boolean(
-      state.getIn(["CommonData", "videoNormalListLoading"]),
+    const { fullPayload, selectedFolders, folders, search } = channel;
+    const merged = channel === media.image && selectedFolders !== null;
+    container.classList.add("esvf-layout");
+    container.classList.toggle("esvf-merged", merged);
+    container.style.setProperty(
+      "--esvf-offset",
+      channel === media.image && !merged && fullPayload?.count ? "438px" : "296px",
     );
-    const blocked = interactionBlocked(state);
-    const total = fullPayload?.videoList.length || 0;
-    const visible =
-      state.getIn(["CommonData", "videoInfo", "videoList"])?.size || 0;
+    const loading = Boolean(
+      state.getIn(["CommonData", channel.loading]),
+    );
+    const blocked = interactionBlocked(state, channel);
+    const total = fullPayload?.count || 0;
+    const visible = state.getIn(["CommonData", channel.info, "count"]) || 0;
+    title.textContent = `${channel.label}文件夹 · 多选`;
     const selectionText =
       selectedFolders === null
         ? "全部文件夹"
         : `已选 ${selectedFolders.size} 个文件夹`;
     caption.textContent = fullPayload
-      ? `共 ${folders.length} 个文件夹 · ${selectionText} · 当前 ${visible} / 共 ${total} 个视频${loading ? " · 正在更新" : ""}`
-      : "正在等待视频列表…";
+      ? `共 ${folders.length} 个文件夹 · ${selectionText} · 当前 ${visible} / 共 ${total} 个${channel.label}${loading ? " · 正在更新" : ""}`
+      : `正在等待${channel.label}列表…`;
     if (blocked !== lastBlocked) {
       lastBlocked = blocked;
       listDirty = true;
@@ -424,11 +546,11 @@
     if (!listDirty) return;
     listDirty = false;
     const fragment = document.createDocumentFragment();
-    fragment.append(folderButton(null, total, blocked || !fullPayload));
+    fragment.append(folderButton(channel, null, total, blocked || !fullPayload));
     let matched = 0;
     for (const folder of folders) {
       if (search && !folder.path.toLocaleLowerCase().includes(search)) continue;
-      fragment.append(folderButton(folder.path, folder.count, blocked));
+      fragment.append(folderButton(channel, folder.path, folder.count, blocked));
       matched++;
     }
     if (search && !matched)
