@@ -1,4 +1,4 @@
-const { test, afterEach } = require('node:test');
+const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const script = require('./xiaohongshu-image-download.user.js');
 
@@ -17,8 +17,14 @@ const videoNote = () => ({
   }], EF6: [] } } },
 });
 
+let storage;
+beforeEach(() => {
+  storage = new Map();
+  global.GM_getValue = (key, fallback) => storage.has(key) ? storage.get(key) : fallback;
+  global.GM_setValue = (key, value) => storage.set(key, value);
+});
 afterEach(() => {
-  for (const key of ['GM_xmlhttpRequest', 'GM_download', 'unsafeWindow', 'document', 'location', 'fetch']) {
+  for (const key of ['GM_xmlhttpRequest', 'GM_download', 'unsafeWindow', 'document', 'location', 'fetch', 'GM_getValue', 'GM_setValue']) {
     delete global[key];
   }
 });
@@ -146,7 +152,82 @@ test('点击视频卡片完成 MP4 保存并显示视频成功提示', async () 
   assert.equal(button.textContent, '视频已下载');
   assert.equal(button.disabled, false);
   assert.equal(toast.textContent, '已保存视频');
+  assert.equal(button.dataset.downloaded, 'true');
+  assert.equal(script.isDownloaded(id), true);
   // 全部成功后再次点击允许重新保存。
   await script.downloadCard(card, button);
   assert.equal(saved.length, 2);
 });
+
+test('已下载标记在脚本重载后恢复，其他笔记不染黄', () => {
+  const id = '6ad488f2000000002a00cef8';
+  global.document = {};
+  script.markDownloaded(id);
+  const fs = require('node:fs'), vm = require('node:vm');
+  const context = { module: { exports: {} }, GM_getValue: global.GM_getValue, GM_setValue: global.GM_setValue };
+  vm.runInNewContext(fs.readFileSync(require.resolve('./xiaohongshu-image-download.user.js'), 'utf8'), context);
+  const button = { dataset: {} };
+  context.module.exports.syncDownloadMark(button, id, true);
+  assert.equal(button.textContent, '✓ 已下载');
+  assert.equal(button.dataset.downloaded, 'true');
+  context.module.exports.syncDownloadMark(button, '6ad488f2000000002a00cef9', true);
+  assert.equal(button.textContent, '↓ 下载');
+  assert.equal(button.dataset.downloaded, 'false');
+});
+test('图集只保存一张、其余失败时也持久标记已下载', async () => {
+  const id = '6ad488f2000000002a00c001';
+  const note = { type: 'normal', imageList: [{ urlDefault: imageUrl }, { urlDefault: imageUrl + '?second=1' }] };
+  mockPage(note);
+  unsafeWindow.__INITIAL_STATE__.note.noteDetailMap[id] = { note };
+  const toast = { dataset: {}, remove() {} };
+  document.getElementById = () => toast;
+  global.location = { href: 'https://www.xiaohongshu.com/', origin: 'https://www.xiaohongshu.com' };
+  const card = { querySelectorAll: () => [{ href: `https://www.xiaohongshu.com/explore/${id}` }],
+    getAttribute: () => id, querySelector: () => null };
+  const button = { dataset: {} };
+  global.GM_xmlhttpRequest = options => options.onload({ status: options.url.includes('second') ? 500 : 200, response: jpeg });
+  global.GM_download = options => options.onload();
+  const warn = console.warn; console.warn = () => {};
+  try {
+    await script.downloadCard(card, button);
+    assert.equal(script.isDownloaded(id), true);
+    assert.equal(button.dataset.downloaded, 'true');
+    assert.equal(button.textContent, '已下载 1/2');
+    assert.match(toast.textContent, /已保存 1\/2/);
+  } finally { console.warn = warn; }
+});
+
+for (const firstSaved of [true, false]) {
+  test(firstSaved ? '第一张落盘即持久标记，随后取消其他图片不清除' : '所有图片都取消时不标记已下载', async () => {
+    const id = firstSaved ? '6ad488f2000000002a00c002' : '6ad488f2000000002a00c003';
+    const note = { type: 'normal', imageList: [{ urlDefault: imageUrl }, { urlDefault: imageUrl + '?second=1' }] };
+    mockPage(note);
+    unsafeWindow.__INITIAL_STATE__.note.noteDetailMap[id] = { note };
+    const toast = { dataset: {}, remove() {} };
+    document.getElementById = () => toast;
+    global.location = { href: 'https://www.xiaohongshu.com/', origin: 'https://www.xiaohongshu.com' };
+    const card = { querySelectorAll: () => [{ href: `https://www.xiaohongshu.com/explore/${id}` }],
+      getAttribute: () => id, querySelector: () => null };
+    const button = { dataset: {} };
+    global.GM_xmlhttpRequest = options => {
+      if (options.url.includes('second')) {
+        assert.equal(script.isDownloaded(id), firstSaved);
+        assert.equal(button.dataset.downloaded, String(firstSaved));
+      }
+      options.onload({ status: 200, response: jpeg });
+    };
+    global.GM_download = options => {
+      if (firstSaved && /_01\.jpg$/.test(options.name)) options.onload();
+      else options.onerror({ error: 'user_canceled' });
+    };
+    const timeout = global.setTimeout, warn = console.warn;
+    global.setTimeout = (...args) => timeout(...args).unref(); console.warn = () => {};
+    try {
+      await script.downloadCard(card, button);
+      assert.equal(script.isDownloaded(id), firstSaved);
+      assert.equal(button.dataset.downloaded, String(firstSaved));
+      assert.equal(button.textContent, firstSaved ? '已下载 1/2' : '重试 0/2');
+      assert.match(toast.textContent, firstSaved ? /已保存 1\/2/ : /已保存 0\/2/);
+    } finally { global.setTimeout = timeout; console.warn = warn; }
+  });
+}

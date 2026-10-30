@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小红书列表 · 图片与视频下载（实况仅图片）
 // @namespace    oh-my-browser/xiaohongshu-images
-// @version      1.1.0
+// @version      1.2.2
 // @description  悬停笔记卡片下载详情图片或纯视频笔记；实况仅保存静态图，不使用列表缩略图。
 // @match        https://www.xiaohongshu.com/*
 // @match        https://xiaohongshu.com/*
@@ -9,6 +9,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
 // @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      xhscdn.com
 // @run-at       document-idle
 // @noframes
@@ -21,6 +23,28 @@
   const BUTTON = 'xhs-image-download-button';
   const savedMedia = new Map();
   let downloading = false;
+
+  // 每个作品单独存储，避免不同标签页同时下载时覆盖整份记录。
+  function isDownloaded(id) {
+    return typeof GM_getValue === 'function' && GM_getValue(`downloaded:v1:${id}`, false) === true;
+  }
+  function syncDownloadMark(button, id, reset = false) {
+    const marked = isDownloaded(id);
+    const changed = button.dataset.downloadId !== id || button.dataset.downloaded !== String(marked);
+    button.dataset.downloadId = id;
+    button.dataset.downloaded = String(marked);
+    if ((reset || changed) && button.dataset.busy !== 'true') {
+      button.textContent = marked ? '✓ 已下载' : '↓ 下载';
+    }
+  }
+  function markDownloaded(id) {
+    try { GM_setValue(`downloaded:v1:${id}`, true); }
+    catch { throw new Error('文件已保存，但下载标记未能持久保存，请检查油猴存储权限'); }
+    for (const button of document.querySelectorAll?.(`.${BUTTON}`) || []) {
+      if (button.dataset?.downloadId === id) syncDownloadMark(button, id);
+    }
+  }
+
 
   function unwrap(value) {
     return value?.__v_isRef ? value.value : value;
@@ -411,8 +435,13 @@
     let total = 0;
     let done;
     let kind;
+    let id;
+    const label = text => { if (button.dataset.downloadId === id) button.textContent = text; };
     try {
-      const { id, url } = cardLink(card);
+      const info = cardLink(card);
+      id = info.id;
+      const { url } = info;
+      syncDownloadMark(button, id);
       const result = await loadNote(id, url);
       const { note, media } = result;
       kind = result.kind;
@@ -429,12 +458,15 @@
       const failures = [];
       for (const item of media) {
         if (done.has(item.index)) continue;
-        button.textContent = isVideo ? '下载视频…' : `下载 ${item.index + 1}/${total}`;
+        label(isVideo ? '下载视频…' : `下载 ${item.index + 1}/${total}`);
         try {
           const { blob, ext } = await (isVideo ? requestVideoWithFallback(item.urls) : requestImage(item.url));
           await saveBlob(blob, `${prefix}_${String(item.index + 1).padStart(2, '0')}.${ext}`);
           done.add(item.index);
           successes++;
+          // 任一文件落盘即记录，不等待整篇完成；之后取消其他文件也保留标记。
+          if (!isDownloaded(id)) markDownloaded(id);
+          if (button.dataset.downloadId === id) syncDownloadMark(button, id);
         } catch (error) {
           failures.push(`${isVideo ? '视频' : `第 ${item.index + 1} 张`}：${error.message}`);
           // 权限配置错误时无需继续请求剩余图片。
@@ -442,10 +474,13 @@
         }
       }
       if (failures.length) throw new Error(failures.join('；'));
-      button.textContent = isVideo ? '视频已下载' : `已下载 ${successes} 张`;
+      label(isVideo ? '视频已下载' : `已下载 ${successes} 张`);
       notify(isVideo ? '已保存视频' : `已保存 ${successes} 张详情图片（不包含实况视频）`);
     } catch (error) {
-      button.textContent = total ? `重试 ${successes}/${total}` : '重试下载';
+      if (!id) button.textContent = '重试下载';
+      else label(isDownloaded(id)
+        ? (successes > 0 && successes < total ? `已下载 ${successes}/${total}` : '✓ 已下载')
+        : (total ? `重试 ${successes}/${total}` : '重试下载'));
       notify(`${total ? `已保存 ${successes}/${total} ${kind === 'video' ? '个视频' : '张图片'}。` : ''}${error.message}`, true);
       console.warn('[小红书下载]', error.message);
     } finally {
@@ -457,12 +492,16 @@
 
   function attachButtons() {
     for (const card of document.querySelectorAll(CARD)) {
-      if (card.querySelector(`.${BUTTON}`)) continue;
+      let id;
+      try { id = cardLink(card).id; } catch { continue; }
+      const existing = card.querySelector(`.${BUTTON}`);
+      if (existing) { syncDownloadMark(existing, id); continue; }
       if (getComputedStyle(card).position === 'static') card.classList.add('xhs-image-download-relative');
       const button = document.createElement('button');
       button.className = BUTTON;
       button.type = 'button';
       button.textContent = '↓ 下载';
+      syncDownloadMark(button, id, true);
       button.title = '下载这篇笔记的详情图片或视频（实况只保存静态图）';
       button.setAttribute('aria-label', button.title);
       for (const event of ['pointerdown', 'mousedown', 'dblclick']) {
@@ -493,6 +532,11 @@
       ${CARD} > .${BUTTON}:hover { background: #ff2442; }
       ${CARD} > .${BUTTON}:focus-visible { opacity: 1; outline: 2px solid #ff2442; outline-offset: 2px; }
       ${CARD} > .${BUTTON}:disabled { cursor: progress; }
+      ${CARD} > .${BUTTON}[data-downloaded="true"],
+      ${CARD} > .${BUTTON}[data-downloaded="true"]:hover {
+        background: #facc15; color: #422006; border-color: #fde68a;
+        opacity: 1; pointer-events: auto;
+      }
       @media (hover: none) { ${CARD} > .${BUTTON} { opacity: 1; pointer-events: auto; } }
       #xhs-image-download-toast {
         position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
@@ -503,19 +547,23 @@
       #xhs-image-download-toast[data-error="true"] { background: #93213bf5; }
     `);
     attachButtons();
+    window.addEventListener('focus', attachButtons);
     let timer;
     new MutationObserver(records => {
-      if (!records.some(record => [...record.addedNodes].some(node =>
-        node.nodeType === 1 && (node.matches?.(CARD) || node.querySelector?.(CARD))))) return;
+      if (!records.some(record => !record.target.closest?.(`.${BUTTON}, #xhs-image-download-toast`) &&
+        (record.type === 'attributes' || [...record.addedNodes].some(node =>
+          node.nodeType === 1 && (node.matches?.(CARD) || node.querySelector?.(CARD) || record.target.closest?.(CARD)))))) return;
       clearTimeout(timer);
       timer = setTimeout(attachButtons, 100);
-    }).observe(document.body, { childList: true, subtree: true });
+    }).observe(document.body, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ['href', 'data-note-id'] });
   }
 
   // Node 的离线验证入口；网页环境不会导出或暴露下载 API。
   if (typeof module !== 'undefined' && module.exports && typeof document === 'undefined') {
     module.exports = { noteFromState, readObjectLiteral, noteFromDocument, imageUrl,
       selectImages, selectVideo, videoUrl, cardLink, openDetailImages, detectImage, detectVideo,
-      safeName, requestImage, requestVideo, requestVideoWithFallback, saveBlob, loadNote, downloadCard, start };
+      safeName, requestImage, requestVideo, requestVideoWithFallback, saveBlob, loadNote, downloadCard,
+      attachButtons, isDownloaded, syncDownloadMark, markDownloaded, start };
   } else { start(); }
 })();
